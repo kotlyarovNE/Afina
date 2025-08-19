@@ -9,7 +9,14 @@ import {
   AlertCircle
 } from 'lucide-react';
 import { Chat, ChatFile } from '../types/chat';
-import localforage from 'localforage';
+import { 
+  getUploadedFiles, 
+  uploadFile, 
+  removeUploadedFile,
+  getChatData,
+  addFileToChat,
+  removeFileFromChat
+} from '../utils/storage';
 
 interface FileManagerProps {
   chats: Chat[];
@@ -27,25 +34,34 @@ const FileManager: React.FC<FileManagerProps> = ({
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [dragOver, setDragOver] = useState(false);
+  const [fileLinks, setFileLinks] = useState<{ [fileName: string]: string[] }>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Загрузка всех файлов при монтировании
   React.useEffect(() => {
     loadAllFiles();
-  }, [chats]);
+  }, []);
 
   const loadAllFiles = async () => {
-    const allFiles: ChatFile[] = [];
-    for (const chat of chats) {
-      allFiles.push(...chat.files);
+    try {
+      const uploadedFiles = await getUploadedFiles();
+      setFiles(uploadedFiles);
+      
+      // Загружаем информацию о привязках файлов к чатам
+      const links: { [fileName: string]: string[] } = {};
+      for (const file of uploadedFiles) {
+        links[file.name] = [];
+        for (const chat of chats) {
+          const chatData = await getChatData(chat.id);
+          if (chatData.files.includes(file.name)) {
+            links[file.name].push(chat.id);
+          }
+        }
+      }
+      setFileLinks(links);
+    } catch (error) {
+      console.error('Ошибка загрузки файлов:', error);
     }
-    
-    // Удаляем дубликаты по ID
-    const uniqueFiles = allFiles.filter((file, index, self) => 
-      index === self.findIndex(f => f.id === file.id)
-    );
-    
-    setFiles(uniqueFiles);
   };
 
   const handleFileUpload = async (uploadedFiles: FileList) => {
@@ -58,21 +74,13 @@ const FileManager: React.FC<FileManagerProps> = ({
       for (let i = 0; i < uploadedFiles.length; i++) {
         const file = uploadedFiles[i];
         
-        // Создаем новый файл
-        const newFile: ChatFile = {
-          id: `file_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-          name: file.name,
-          size: file.size,
-          type: file.type,
-          uploadedAt: new Date(),
-        };
-
-        // Сохраняем файл в localforage
-        await localforage.setItem(`file_${newFile.id}`, file);
-        
-        setFiles(prev => [...prev, newFile]);
+        // Загружаем файл на сервер
+        await uploadFile(file);
         setUploadProgress(((i + 1) / uploadedFiles.length) * 100);
       }
+      
+      // Перезагружаем список файлов
+      await loadAllFiles();
     } catch (error) {
       console.error('Ошибка загрузки файлов:', error);
     } finally {
@@ -99,60 +107,41 @@ const FileManager: React.FC<FileManagerProps> = ({
     setDragOver(false);
   }, []);
 
-  const deleteFile = async (fileId: string) => {
+  const deleteFile = async (fileName: string) => {
     try {
-      // Удаляем файл из localforage
-      await localforage.removeItem(`file_${fileId}`);
-      
-      // Удаляем файл из всех чатов
-      for (const chat of chats) {
-        const updatedFiles = chat.files.filter(f => f.id !== fileId);
-        if (updatedFiles.length !== chat.files.length) {
-          await onUpdateChat({
-            ...chat,
-            files: updatedFiles,
-            updatedAt: new Date(),
-          });
-        }
-      }
-      
-      // Обновляем локальный список
-      setFiles(prev => prev.filter(f => f.id !== fileId));
+      await removeUploadedFile(fileName);
+      await loadAllFiles(); // Перезагружаем список файлов
     } catch (error) {
       console.error('Ошибка удаления файла:', error);
     }
   };
 
-  const linkFileToChat = async (fileId: string, chatId: string) => {
-    const file = files.find(f => f.id === fileId);
-    const chat = chats.find(c => c.id === chatId);
-    
-    if (!file || !chat) return;
-
-    // Проверяем, не привязан ли уже файл к этому чату
-    const isAlreadyLinked = chat.files.some(f => f.id === fileId);
-    
-    if (isAlreadyLinked) {
-      // Отвязываем файл
-      const updatedFiles = chat.files.filter(f => f.id !== fileId);
-      await onUpdateChat({
-        ...chat,
-        files: updatedFiles,
-        updatedAt: new Date(),
-      });
-    } else {
-      // Привязываем файл
-      await onUpdateChat({
-        ...chat,
-        files: [...chat.files, file],
-        updatedAt: new Date(),
-      });
+  const linkFileToChat = async (fileName: string, chatId: string) => {
+    try {
+      const isAlreadyLinked = fileLinks[fileName]?.includes(chatId) || false;
+      
+      if (isAlreadyLinked) {
+        // Отвязываем файл
+        await removeFileFromChat(chatId, fileName);
+        setFileLinks(prev => ({
+          ...prev,
+          [fileName]: prev[fileName]?.filter(id => id !== chatId) || []
+        }));
+      } else {
+        // Привязываем файл
+        await addFileToChat(chatId, fileName);
+        setFileLinks(prev => ({
+          ...prev,
+          [fileName]: [...(prev[fileName] || []), chatId]
+        }));
+      }
+    } catch (error) {
+      console.error('Ошибка привязки файла к чату:', error);
     }
   };
 
-  const isFileLinkedToChat = (fileId: string, chatId: string) => {
-    const chat = chats.find(c => c.id === chatId);
-    return chat?.files.some(f => f.id === fileId) || false;
+  const isFileLinkedToChat = (fileName: string, chatId: string) => {
+    return fileLinks[fileName]?.includes(chatId) || false;
   };
 
   const formatFileSize = (bytes: number) => {
@@ -282,14 +271,14 @@ const FileManager: React.FC<FileManagerProps> = ({
                             {chats.map((chat) => (
                               <button
                                 key={chat.id}
-                                onClick={() => linkFileToChat(file.id, chat.id)}
+                                onClick={() => linkFileToChat(file.name, chat.id)}
                                 className={`px-3 py-1 rounded-full text-xs transition-colors ${
-                                  isFileLinkedToChat(file.id, chat.id)
+                                  isFileLinkedToChat(file.name, chat.id)
                                     ? 'bg-primary-600 text-white'
                                     : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
                                 }`}
                               >
-                                {isFileLinkedToChat(file.id, chat.id) && (
+                                {isFileLinkedToChat(file.name, chat.id) && (
                                   <Check className="w-3 h-3 inline mr-1" />
                                 )}
                                 {chat.name}
@@ -300,7 +289,7 @@ const FileManager: React.FC<FileManagerProps> = ({
                       </div>
                       
                       <button
-                        onClick={() => deleteFile(file.id)}
+                        onClick={() => deleteFile(file.name)}
                         className="p-2 hover:bg-red-100 rounded-lg transition-colors group"
                       >
                         <Trash2 className="w-4 h-4 text-gray-400 group-hover:text-red-500" />

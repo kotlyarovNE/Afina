@@ -8,10 +8,12 @@ import {
   ChevronRight, 
   Files,
   Upload,
-  X
+  X,
+  AlertTriangle
 } from 'lucide-react';
 import { Chat } from '../types/chat';
 import FileManager from './FileManager';
+import ConfirmDialog from './ConfirmDialog';
 
 interface SidebarProps {
   isOpen: boolean;
@@ -35,6 +37,8 @@ const Sidebar: React.FC<SidebarProps> = ({
   const [showNewChatInput, setShowNewChatInput] = useState(false);
   const [newChatName, setNewChatName] = useState('');
   const [showFileManager, setShowFileManager] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [chatToDelete, setChatToDelete] = useState<Chat | null>(null);
   const router = useRouter();
 
   const handleCreateChat = async () => {
@@ -52,6 +56,25 @@ const Sidebar: React.FC<SidebarProps> = ({
       setShowNewChatInput(false);
       setNewChatName('');
     }
+  };
+
+  const handleDeleteClick = (chat: Chat, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setChatToDelete(chat);
+    setShowDeleteConfirm(true);
+  };
+
+  const confirmDelete = async () => {
+    if (chatToDelete) {
+      await onDeleteChat(chatToDelete.id);
+      setShowDeleteConfirm(false);
+      setChatToDelete(null);
+    }
+  };
+
+  const cancelDelete = () => {
+    setShowDeleteConfirm(false);
+    setChatToDelete(null);
   };
 
   const formatDate = (date: Date) => {
@@ -190,35 +213,22 @@ const Sidebar: React.FC<SidebarProps> = ({
                         {chat.name}
                       </h3>
                       <p className="text-sm text-gray-500 truncate">
-                        {chat.messages.length > 0 
-                          ? chat.messages[chat.messages.length - 1].content
-                          : 'Новый чат'
-                        }
+                        Новый чат
                       </p>
                       <div className="flex items-center mt-1 space-x-2">
                         <span className="text-xs text-gray-400">
-                          {formatDate(chat.updatedAt)}
+                          {formatDate(new Date(chat.updatedAt))}
                         </span>
-                        {chat.files.length > 0 && (
-                          <span className="text-xs text-primary-600 bg-primary-100 px-1 rounded">
-                            {chat.files.length} файл(ов)
-                          </span>
-                        )}
                       </div>
                     </div>
                     <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onDeleteChat(chat.id);
-                      }}
+                      onClick={(e) => handleDeleteClick(chat, e)}
                       className="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-100 rounded transition-all"
                     >
                       <Trash2 className="w-4 h-4 text-red-500" />
                     </button>
                   </div>
-                  {chat.isAgentTyping && (
-                    <div className="absolute -top-1 -right-1 w-3 h-3 bg-green-500 rounded-full animate-pulse"></div>
-                  )}
+
                 </div>
               ))
             )}
@@ -232,6 +242,20 @@ const Sidebar: React.FC<SidebarProps> = ({
           chats={chats}
           onClose={() => setShowFileManager(false)}
           onUpdateChat={onUpdateChat}
+        />
+      )}
+
+      {/* Delete Confirmation Dialog */}
+      {showDeleteConfirm && chatToDelete && (
+        <ConfirmDialog
+          isOpen={showDeleteConfirm}
+          title="Удаление чата"
+          message={`Вы точно хотите удалить чат "${chatToDelete.name}"?`}
+          confirmText="Удалить"
+          cancelText="Отмена"
+          onConfirm={confirmDelete}
+          onCancel={cancelDelete}
+          type="danger"
         />
       )}
     </>

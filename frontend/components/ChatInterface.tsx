@@ -4,32 +4,48 @@ import ReactMarkdown from 'react-markdown';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { Message, Chat, ChatFile } from '../types/chat';
-import localforage from 'localforage';
+import { getChatData, getChatFiles } from '../utils/storage';
 
 interface ChatInterfaceProps {
   chat: Chat;
-  onUpdateChat: (chat: Chat) => Promise<void>;
-  onSendMessage: (message: string, chatId: string, files: ChatFile[]) => Promise<void>;
+  onSendMessage: (message: string, chatId: string, files: string[]) => Promise<void>;
   isAgentTyping: boolean;
 }
 
 const ChatInterface: React.FC<ChatInterfaceProps> = ({
   chat,
-  onUpdateChat,
   onSendMessage,
   isAgentTyping,
 }) => {
   const [message, setMessage] = useState('');
   const [showFiles, setShowFiles] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [chatFiles, setChatFiles] = useState<ChatFile[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
 
+  // Загрузка данных чата при изменении chat.id
+  useEffect(() => {
+    loadChatData();
+  }, [chat.id]);
+
+  // Периодическое обновление данных чата для отображения потоковых сообщений
+  useEffect(() => {
+    if (!isAgentTyping) return;
+    
+    const interval = setInterval(() => {
+      loadChatData();
+    }, 200); // Обновляем каждые 200ms во время печати агента
+
+    return () => clearInterval(interval);
+  }, [isAgentTyping, chat.id]);
+
   // Автоматический скролл к последнему сообщению
   useEffect(() => {
     scrollToBottom();
-  }, [chat.messages, isAgentTyping]);
+  }, [messages, isAgentTyping]);
 
   // Автоматическое изменение размера textarea
   useEffect(() => {
@@ -48,6 +64,18 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
     }
   }, [message]);
 
+  const loadChatData = async () => {
+    try {
+      const chatData = await getChatData(chat.id);
+      const files = await getChatFiles(chat.id);
+      
+      setMessages(chatData.messages);
+      setChatFiles(files);
+    } catch (error) {
+      console.error('Ошибка загрузки данных чата:', error);
+    }
+  };
+
   const scrollToBottom = () => {
     if (messagesEndRef.current) {
       messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
@@ -61,22 +89,19 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
     const trimmedMessage = message.trim();
     setMessage('');
 
-    // Добавляем сообщение пользователя
+    // Добавляем сообщение пользователя локально
     const userMessage: Message = {
-      id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      id: `${chat.id.replace('chat_', '')}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       content: trimmedMessage,
       sender: 'user',
       timestamp: new Date(),
     };
 
-    const updatedChat = {
-      ...chat,
-      messages: [...chat.messages, userMessage],
-      updatedAt: new Date(),
-    };
+    setMessages(prev => [...prev, userMessage]);
 
-    await onUpdateChat(updatedChat);
-    await onSendMessage(trimmedMessage, chat.id, chat.files);
+    // Отправляем сообщение с именами файлов
+    const fileNames = chatFiles.map(f => f.name);
+    await onSendMessage(trimmedMessage, chat.id, fileNames);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -93,14 +118,14 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
     });
   };
 
-  const removeFileFromChat = async (fileId: string) => {
-    const updatedFiles = chat.files.filter(f => f.id !== fileId);
-    const updatedChat = {
-      ...chat,
-      files: updatedFiles,
-      updatedAt: new Date(),
-    };
-    await onUpdateChat(updatedChat);
+  const removeFileFromChat = async (fileName: string) => {
+    try {
+      const { removeFileFromChat: removeFile } = await import('../utils/storage');
+      await removeFile(chat.id, fileName);
+      await loadChatData(); // Перезагружаем данные чата
+    } catch (error) {
+      console.error('Ошибка удаления файла из чата:', error);
+    }
   };
 
   return (
@@ -110,27 +135,27 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
         <div className="flex-1">
           <h1 className="text-xl font-semibold text-gray-900">{chat.name}</h1>
           <p className="text-sm text-gray-500">
-            {chat.messages.length} сообщений
-            {chat.files.length > 0 && ` • ${chat.files.length} файл(ов)`}
+            {messages.length} сообщений
+            {chatFiles.length > 0 && ` • ${chatFiles.length} файл(ов)`}
           </p>
         </div>
         
         {/* Files Button */}
-        {chat.files.length > 0 && (
+        {chatFiles.length > 0 && (
           <button
             onClick={() => setShowFiles(!showFiles)}
             className="relative p-2 hover:bg-gray-100 rounded-lg transition-colors"
           >
             <Files className="w-5 h-5 text-gray-600" />
             <span className="absolute -top-1 -right-1 bg-primary-600 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
-              {chat.files.length}
+              {chatFiles.length}
             </span>
           </button>
         )}
       </div>
 
       {/* Files Panel */}
-      {showFiles && chat.files.length > 0 && (
+      {showFiles && chatFiles.length > 0 && (
         <div className="border-b border-gray-200 bg-gray-50 p-4">
           <div className="flex items-center justify-between mb-3">
             <h3 className="font-medium text-gray-900">Файлы в чате</h3>
@@ -142,7 +167,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
             </button>
           </div>
           <div className="space-y-2">
-            {chat.files.map((file) => (
+            {chatFiles.map((file) => (
               <div
                 key={file.id}
                 className="flex items-center justify-between p-2 bg-white rounded-lg border border-gray-200"
@@ -155,7 +180,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
                   </span>
                 </div>
                 <button
-                  onClick={() => removeFileFromChat(file.id)}
+                  onClick={() => removeFileFromChat(file.name)}
                   className="p-1 hover:bg-red-100 rounded transition-colors"
                 >
                   <X className="w-3 h-3 text-red-500" />
@@ -171,7 +196,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
         ref={messagesContainerRef}
         className="flex-1 overflow-y-auto p-4 space-y-4"
       >
-        {chat.messages.length === 0 ? (
+        {messages.length === 0 ? (
           <div className="text-center py-12">
             <div className="w-16 h-16 bg-gradient-to-r from-blue-600 to-purple-600 rounded-full flex items-center justify-center mx-auto mb-4">
               <span className="text-white text-2xl font-bold">A</span>
@@ -185,7 +210,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
             </p>
           </div>
         ) : (
-          chat.messages.map((msg) => (
+          messages.map((msg) => (
             <div
               key={msg.id}
               className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}

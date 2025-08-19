@@ -2,7 +2,15 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/router';
 import { GetServerSideProps } from 'next';
 import ChatInterface from '../../components/ChatInterface';
-import { Chat, Message, ChatFile } from '../../types/chat';
+import { Chat, Message } from '../../types/chat';
+import { 
+  getChatMetadata, 
+  getChatData, 
+  addMessageToChat, 
+  updateLastMessage, 
+  setTypingState, 
+  getTypingState 
+} from '../../utils/storage';
 import localforage from 'localforage';
 
 const ChatPage: React.FC = () => {
@@ -10,13 +18,14 @@ const ChatPage: React.FC = () => {
   const { id } = router.query;
   const [chat, setChat] = useState<Chat | null>(null);
   const [isAgentTyping, setIsAgentTyping] = useState(false);
-  const [typingStates, setTypingStates] = useState<{ [key: string]: boolean }>({});
 
   // Загрузка чата
   useEffect(() => {
     if (id && typeof id === 'string') {
       loadChat(id);
       checkTypingState(id);
+      // Очищаем состояние печати при загрузке страницы (на случай зависания)
+      clearTypingStateOnPageLoad(id);
     }
   }, [id]);
 
@@ -33,14 +42,11 @@ const ChatPage: React.FC = () => {
 
   const loadChat = async (chatId: string) => {
     try {
-      const chats = await localforage.getItem<Chat[]>('afina_chats');
-      if (chats) {
-        const foundChat = chats.find(c => c.id === chatId);
-        if (foundChat) {
-          setChat(foundChat);
-        } else {
-          router.push('/');
-        }
+      const metadata = await getChatMetadata();
+      const foundChat = metadata[chatId];
+      
+      if (foundChat) {
+        setChat(foundChat);
       } else {
         router.push('/');
       }
@@ -52,30 +58,46 @@ const ChatPage: React.FC = () => {
 
   const checkTypingState = async (chatId: string) => {
     try {
-      const isTyping = await localforage.getItem<boolean>(`${chatId}_typing`);
-      setIsAgentTyping(!!isTyping);
+      const isTyping = await getTypingState(chatId);
+      setIsAgentTyping(isTyping);
     } catch (error) {
       console.error('Ошибка проверки состояния печати:', error);
     }
   };
 
-  const updateChat = async (updatedChat: Chat) => {
+  const clearTypingStateOnPageLoad = async (chatId: string) => {
     try {
-      const chats = await localforage.getItem<Chat[]>('afina_chats');
-      if (chats) {
-        const newChats = chats.map(c => c.id === updatedChat.id ? updatedChat : c);
-        await localforage.setItem('afina_chats', newChats);
-        setChat(updatedChat);
+      // При загрузке страницы проверяем, не зависло ли состояние печати
+      // Если прошло больше 30 секунд с последнего обновления, очищаем состояние
+      const lastTypingTime = await localforage.getItem<number>(`${chatId}_typing_timestamp`);
+      const now = Date.now();
+      
+      if (lastTypingTime && (now - lastTypingTime) > 30000) {
+        // Прошло больше 30 секунд, очищаем состояние
+        await setTypingState(chatId, false);
+        await localforage.removeItem(`${chatId}_typing_timestamp`);
+        console.log('Очищено зависшее состояние печати для чата:', chatId);
       }
     } catch (error) {
-      console.error('Ошибка обновления чата:', error);
+      console.error('Ошибка очистки состояния печати:', error);
     }
   };
 
-  const sendMessage = useCallback(async (message: string, chatId: string, files: ChatFile[]) => {
+  const sendMessage = useCallback(async (message: string, chatId: string, files: string[]) => {
     try {
+      // Сначала добавляем сообщение пользователя в хранилище
+      const userMessage: Message = {
+        id: `${chatId.replace('chat_', '')}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        content: message,
+        sender: 'user',
+        timestamp: new Date(),
+      };
+
+      await addMessageToChat(chatId, userMessage);
+
       // Устанавливаем состояние печати
-      await localforage.setItem(`${chatId}_typing`, true);
+      await setTypingState(chatId, true);
+      await localforage.setItem(`${chatId}_typing_timestamp`, Date.now());
       setIsAgentTyping(true);
 
       // Отправляем запрос на сервер
@@ -100,22 +122,14 @@ const ChatPage: React.FC = () => {
 
       // Создаем сообщение агента
       const agentMessage: Message = {
-        id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        id: `${chatId.replace('chat_', '')}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         content: '',
         sender: 'agent',
         timestamp: new Date(),
       };
 
-      // Обновляем чат с новым сообщением
-      const currentChat = await localforage.getItem<Chat[]>('afina_chats');
-      if (currentChat) {
-        const chatIndex = currentChat.findIndex(c => c.id === chatId);
-        if (chatIndex !== -1) {
-          currentChat[chatIndex].messages.push(agentMessage);
-          await localforage.setItem('afina_chats', currentChat);
-          setChat(currentChat[chatIndex]);
-        }
-      }
+      // Добавляем сообщение агента в хранилище
+      await addMessageToChat(chatId, agentMessage);
 
       // Читаем поток ответа
       let fullContent = '';
@@ -136,20 +150,8 @@ const ChatPage: React.FC = () => {
                 if (data.content) {
                   fullContent += data.content;
                   
-                  // Обновляем сообщение в реальном времени
-                  const chats = await localforage.getItem<Chat[]>('afina_chats');
-                  if (chats) {
-                    const chatIndex = chats.findIndex(c => c.id === chatId);
-                    if (chatIndex !== -1) {
-                      const messageIndex = chats[chatIndex].messages.findIndex(m => m.id === agentMessage.id);
-                      if (messageIndex !== -1) {
-                        chats[chatIndex].messages[messageIndex].content = fullContent;
-                        chats[chatIndex].updatedAt = new Date();
-                        await localforage.setItem('afina_chats', chats);
-                        setChat(chats[chatIndex]);
-                      }
-                    }
-                  }
+                  // Обновляем последнее сообщение в хранилище
+                  await updateLastMessage(chatId, fullContent);
                 }
 
                 if (data.done) {
@@ -163,7 +165,8 @@ const ChatPage: React.FC = () => {
         }
       } finally {
         // Убираем состояние печати
-        await localforage.removeItem(`${chatId}_typing`);
+        await setTypingState(chatId, false);
+        await localforage.removeItem(`${chatId}_typing_timestamp`);
         setIsAgentTyping(false);
       }
 
@@ -171,28 +174,21 @@ const ChatPage: React.FC = () => {
       console.error('Ошибка отправки сообщения:', error);
       
       // Убираем состояние печати в случае ошибки
-      await localforage.removeItem(`${chatId}_typing`);
+      await setTypingState(chatId, false);
+      await localforage.removeItem(`${chatId}_typing_timestamp`);
       setIsAgentTyping(false);
 
       // Добавляем сообщение об ошибке
-      if (chat) {
-        const errorMessage: Message = {
-          id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-          content: 'Извините, произошла ошибка при обработке вашего сообщения. Пожалуйста, попробуйте еще раз.',
-          sender: 'agent',
-          timestamp: new Date(),
-        };
+      const errorMessage: Message = {
+        id: `${chatId.replace('chat_', '')}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        content: 'Извините, произошла ошибка при обработке вашего сообщения. Пожалуйста, попробуйте еще раз.',
+        sender: 'agent',
+        timestamp: new Date(),
+      };
 
-        const updatedChat = {
-          ...chat,
-          messages: [...chat.messages, errorMessage],
-          updatedAt: new Date(),
-        };
-
-        await updateChat(updatedChat);
-      }
+      await addMessageToChat(chatId, errorMessage);
     }
-  }, [chat]);
+  }, []);
 
   if (!chat) {
     return (
@@ -208,7 +204,6 @@ const ChatPage: React.FC = () => {
   return (
     <ChatInterface
       chat={chat}
-      onUpdateChat={updateChat}
       onSendMessage={sendMessage}
       isAgentTyping={isAgentTyping}
     />

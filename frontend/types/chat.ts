@@ -17,11 +17,18 @@ export interface ChatFile {
 export interface Chat {
   id: string;
   name: string;
-  messages: Message[];
-  files: ChatFile[];
   createdAt: Date;
   updatedAt: Date;
-  isAgentTyping?: boolean;
+}
+
+export interface ChatData {
+  messages: Message[];
+  files: string[]; // Массив имен файлов
+  typing: boolean;
+}
+
+export interface ChatMetadata {
+  [chatId: string]: Chat;
 }
 
 export interface TypingState {

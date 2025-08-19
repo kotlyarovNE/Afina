@@ -2,7 +2,13 @@ import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/router';
 import Sidebar from './Sidebar';
 import { Chat } from '../types/chat';
-import localforage from 'localforage';
+import { 
+  getChatMetadata, 
+  createNewChat as createChat, 
+  deleteChat as removeChatStorage, 
+  updateChat as updateChatStorage,
+  migrateOldData 
+} from '../utils/storage';
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -16,7 +22,7 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
 
   // Загрузка чатов при монтировании
   useEffect(() => {
-    loadChats();
+    initializeChats();
   }, []);
 
   // Обновление текущего чата при изменении URL
@@ -28,59 +34,65 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
     }
   }, [router.query.id]);
 
+  const initializeChats = async () => {
+    try {
+      // Сначала проверяем и мигрируем старые данные
+      await migrateOldData();
+      
+      // Затем загружаем чаты
+      await loadChats();
+    } catch (error) {
+      console.error('Ошибка инициализации чатов:', error);
+    }
+  };
+
   const loadChats = async () => {
     try {
-      const savedChats = await localforage.getItem<Chat[]>('afina_chats');
-      if (savedChats) {
-        setChats(savedChats);
-      }
+      const metadata = await getChatMetadata();
+      const chatList = Object.values(metadata).sort((a, b) => 
+        new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+      );
+      setChats(chatList);
     } catch (error) {
       console.error('Ошибка загрузки чатов:', error);
     }
   };
 
-  const saveChats = async (newChats: Chat[]) => {
+  const createNewChat = async (name: string) => {
     try {
-      await localforage.setItem('afina_chats', newChats);
-      setChats(newChats);
+      const newChat = await createChat(name);
+      await loadChats(); // Перезагружаем список чатов
+      
+      // Переход на новый чат
+      router.push(`/chat/${newChat.id}`);
+      return newChat;
     } catch (error) {
-      console.error('Ошибка сохранения чатов:', error);
+      console.error('Ошибка создания чата:', error);
+      throw error;
     }
   };
 
-  const createNewChat = async (name: string) => {
-    const newChat: Chat = {
-      id: `chat_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      name: name || 'Новый чат',
-      messages: [],
-      files: [],
-      createdAt: new Date(),
-      updatedAt: new Date()
-    };
-
-    const newChats = [newChat, ...chats];
-    await saveChats(newChats);
-    
-    // Переход на новый чат
-    router.push(`/chat/${newChat.id}`);
-    return newChat;
-  };
-
   const deleteChat = async (chatId: string) => {
-    const newChats = chats.filter(chat => chat.id !== chatId);
-    await saveChats(newChats);
-    
-    // Если удаляем текущий чат, переходим на главную
-    if (currentChatId === chatId) {
-      router.push('/');
+    try {
+      await removeChatStorage(chatId);
+      await loadChats(); // Перезагружаем список чатов
+      
+      // Если удаляем текущий чат, переходим на главную
+      if (currentChatId === chatId) {
+        router.push('/');
+      }
+    } catch (error) {
+      console.error('Ошибка удаления чата:', error);
     }
   };
 
   const updateChat = async (updatedChat: Chat) => {
-    const newChats = chats.map(chat => 
-      chat.id === updatedChat.id ? updatedChat : chat
-    );
-    await saveChats(newChats);
+    try {
+      await updateChatStorage(updatedChat);
+      await loadChats(); // Перезагружаем список чатов
+    } catch (error) {
+      console.error('Ошибка обновления чата:', error);
+    }
   };
 
   return (

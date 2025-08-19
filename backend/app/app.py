@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+import time
 from typing import Optional
 import uuid
 from pathlib import Path
@@ -22,7 +23,7 @@ app.add_middleware(
 )
 
 # Создание папки uploads если её нет
-UPLOADS_DIR = Path("uploads")
+UPLOADS_DIR = Path("app/uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
 
 # Заглушка для агента Afina
@@ -85,59 +86,68 @@ async def chat_endpoint(
 
 @app.post("/api/upload")
 async def upload_file(
-    file: UploadFile = File(...),
-    chat_id: str = Form(...)
+    file: UploadFile = File(...)
 ):
-    """Endpoint для загрузки файлов в чат"""
+    """Endpoint для загрузки файлов в общую папку uploads"""
     try:
-        # Создаем папку для чата если её нет
-        chat_dir = UPLOADS_DIR / chat_id
-        chat_dir.mkdir(exist_ok=True)
+        # Сохраняем файл в общую папку uploads
+        file_path = UPLOADS_DIR / file.filename
         
-        # Сохраняем файл
-        file_path = chat_dir / file.filename
+        # Если файл уже существует, добавляем timestamp к имени
+        if file_path.exists():
+            name, ext = os.path.splitext(file.filename)
+            timestamp = int(time.time())
+            new_filename = f"{name}_{timestamp}{ext}"
+            file_path = UPLOADS_DIR / new_filename
+        else:
+            new_filename = file.filename
+        
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
         # Возвращаем информацию о файле
         return {
             "success": True,
-            "filename": file.filename,
-            "chat_id": chat_id,
+            "filename": new_filename,
+            "original_filename": file.filename,
             "file_path": str(file_path),
-            "message": f"Файл {file.filename} успешно загружен в чат!"
+            "size": file_path.stat().st_size,
+            "message": f"Файл {new_filename} успешно загружен!"
         }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка загрузки файла: {str(e)}")
 
-@app.get("/api/chat/{chat_id}/files")
-async def get_chat_files(chat_id: str):
-    """Получение списка файлов для чата"""
+@app.get("/api/files")
+async def get_all_files():
+    """Получение списка всех загруженных файлов"""
     try:
-        chat_dir = UPLOADS_DIR / chat_id
-        if not chat_dir.exists():
+        if not UPLOADS_DIR.exists():
             return {"files": []}
         
         files = []
-        for file_path in chat_dir.iterdir():
+        for file_path in UPLOADS_DIR.iterdir():
             if file_path.is_file():
                 files.append({
                     "name": file_path.name,
                     "size": file_path.stat().st_size,
+                    "uploaded_at": file_path.stat().st_mtime,
                     "path": str(file_path)
                 })
+        
+        # Сортируем по дате загрузки (новые первые)
+        files.sort(key=lambda x: x["uploaded_at"], reverse=True)
         
         return {"files": files}
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/api/files/{chat_id}/{filename}")
-async def delete_file(chat_id: str, filename: str):
-    """Удаление файла из чата"""
+@app.delete("/api/files/{filename}")
+async def delete_file(filename: str):
+    """Удаление файла из общей папки uploads"""
     try:
-        file_path = UPLOADS_DIR / chat_id / filename
+        file_path = UPLOADS_DIR / filename
         if file_path.exists():
             file_path.unlink()
             return {"success": True, "message": f"Файл {filename} удален"}
