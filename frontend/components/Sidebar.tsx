@@ -100,13 +100,39 @@ const Sidebar: React.FC<SidebarProps> = ({
 
   if (!isOpen) {
     return (
-      <div className="fixed left-0 top-0 z-40">
-        <button
-          onClick={onToggle}
-          className="m-4 p-2 bg-white rounded-lg shadow-lg hover:shadow-xl transition-shadow border border-gray-200"
-        >
-          <ChevronRight className="w-5 h-5 text-gray-600" />
-        </button>
+      <div className="fixed left-0 top-0 w-16 h-full bg-white border-r border-gray-200 z-30 flex flex-col">
+        <div className="p-4 border-b border-gray-200">
+          <button
+            onClick={onToggle}
+            className="w-8 h-8 bg-gray-50 hover:bg-gray-100 rounded-lg transition-colors flex items-center justify-center group"
+            title="Развернуть панель"
+          >
+            <ChevronRight className="w-4 h-4 text-gray-600 group-hover:text-gray-800" />
+          </button>
+        </div>
+        
+        {/* Мини-индикаторы чатов */}
+        <div className="flex-1 overflow-y-auto p-2 space-y-2">
+          {chats.slice(0, 8).map((chat) => (
+            <div
+              key={chat.id}
+              className={`w-12 h-12 rounded-lg flex items-center justify-center text-xs font-medium cursor-pointer transition-all ${
+                currentChatId === chat.id
+                  ? 'bg-primary-600 text-white'
+                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+              }`}
+              onClick={() => router.push(`/chat/${chat.id}`)}
+              title={chat.name}
+            >
+              {chat.name.charAt(0).toUpperCase()}
+            </div>
+          ))}
+          {chats.length > 8 && (
+            <div className="w-12 h-12 rounded-lg bg-gray-100 flex items-center justify-center text-xs text-gray-500">
+              +{chats.length - 8}
+            </div>
+          )}
+        </div>
       </div>
     );
   }

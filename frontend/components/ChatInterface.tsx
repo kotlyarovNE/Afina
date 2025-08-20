@@ -22,9 +22,12 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
   const [isExpanded, setIsExpanded] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatFiles, setChatFiles] = useState<ChatFile[]>([]);
+  const [typingBuffer, setTypingBuffer] = useState<string>('');
+  const [isDisplayingTyping, setIsDisplayingTyping] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const typingIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Загрузка данных чата при изменении chat.id
   useEffect(() => {
@@ -35,12 +38,53 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
   useEffect(() => {
     if (!isAgentTyping) return;
     
-    const interval = setInterval(() => {
-      loadChatData();
-    }, 200); // Обновляем каждые 200ms во время печати агента
+    const interval = setInterval(async () => {
+      const chatData = await getChatData(chat.id);
+      const files = await getChatFiles(chat.id);
+      
+      // Проверяем последнее сообщение агента
+      const lastMessage = chatData.messages[chatData.messages.length - 1];
+      if (lastMessage && lastMessage.sender === 'agent') {
+        const currentLastMessage = messages[messages.length - 1];
+        
+        // Если содержимое изменилось, запускаем плавную печать
+        if (currentLastMessage && currentLastMessage.id === lastMessage.id) {
+          
+          // Определяем новый текст для добавления
+          const newContent = lastMessage.content;
+          const currentContent = currentLastMessage.content;
+          const bufferedLength = typingBuffer.length;
+          
+          // Учитываем текст в буфере при сравнении
+          const totalCurrentLength = currentContent.length + bufferedLength;
+          
+          if (newContent.length > totalCurrentLength) {
+            const additionalText = newContent.slice(totalCurrentLength);
+            setTypingBuffer(prev => prev + additionalText);
+            
+            if (!isDisplayingTyping) {
+              startTypingAnimation();
+            }
+          }
+        } else if (!currentLastMessage || currentLastMessage.id !== lastMessage.id) {
+          // Новое сообщение от агента
+          setMessages(chatData.messages);
+          setChatFiles(files);
+        }
+      }
+    }, 300); // Проверяем обновления каждые 300ms
 
     return () => clearInterval(interval);
-  }, [isAgentTyping, chat.id]);
+  }, [isAgentTyping, chat.id, messages, isDisplayingTyping, typingBuffer]);
+
+  // Очистка интервала при размонтировании
+  useEffect(() => {
+    return () => {
+      if (typingIntervalRef.current) {
+        clearInterval(typingIntervalRef.current);
+      }
+    };
+  }, []);
 
   // Автоматический скролл к последнему сообщению
   useEffect(() => {
@@ -63,6 +107,70 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
       }
     }
   }, [message]);
+
+  // Очистка анимации печати при остановке агента
+  useEffect(() => {
+    if (!isAgentTyping) {
+      if (typingIntervalRef.current) {
+        clearInterval(typingIntervalRef.current);
+        typingIntervalRef.current = null;
+        setIsDisplayingTyping(false);
+      }
+      
+      // Если есть оставшийся буфер, добавляем его сразу
+      if (typingBuffer) {
+        updateLastMessageContent(typingBuffer);
+        setTypingBuffer('');
+      }
+      
+      // Когда агент закончил печатать, обновляем сообщения из хранилища
+      // чтобы убедиться что отображается полный текст
+      setTimeout(() => {
+        loadChatData();
+      }, 100);
+    }
+  }, [isAgentTyping, typingBuffer]);
+
+  const startTypingAnimation = () => {
+    if (typingIntervalRef.current) return;
+    
+    setIsDisplayingTyping(true);
+    typingIntervalRef.current = setInterval(() => {
+      setTypingBuffer(prev => {
+        if (prev.length === 0) {
+          clearInterval(typingIntervalRef.current!);
+          typingIntervalRef.current = null;
+          setIsDisplayingTyping(false);
+          return prev;
+        }
+        
+        // Берем 1-3 символа для имитации реальной печати
+        const charsToAdd = Math.min(Math.floor(Math.random() * 3) + 1, prev.length);
+        const textToAdd = prev.slice(0, charsToAdd);
+        const remaining = prev.slice(charsToAdd);
+        
+        updateLastMessageContent(textToAdd);
+        return remaining;
+      });
+    }, 30); // Печатаем каждые 30ms для плавности
+  };
+
+  const updateLastMessageContent = (textToAdd: string) => {
+    setMessages(prev => {
+      if (prev.length === 0) return prev;
+      
+      const lastMessage = prev[prev.length - 1];
+      if (lastMessage.sender === 'agent') {
+        const updatedMessage = {
+          ...lastMessage,
+          content: lastMessage.content + textToAdd
+        };
+        
+        return [...prev.slice(0, -1), updatedMessage];
+      }
+      return prev;
+    });
+  };
 
   const loadChatData = async () => {
     try {

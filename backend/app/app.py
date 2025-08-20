@@ -1,15 +1,17 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-import asyncio
-import json
-import os
-import shutil
-import time
-from typing import Optional
-import uuid
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
+import asyncio, json, shutil
+from typing import Optional
+from pathlib import Path
+
+from .agent.agent import APP, HumanMessage
+from langchain_core.messages import AIMessageChunk
 
 app = FastAPI(title="Afina Chat API")
 
@@ -25,12 +27,31 @@ app.add_middleware(
 # Создание папки uploads если её нет
 UPLOADS_DIR = Path("app/uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
+TARGET_NODES = {"assistant", "analyze_report"}  # какие ноды отрисовываем на фронте
+
 
 # Заглушка для агента Afina
 AGENT_RESPONSES = {
     "default": "Привет я помощник Afina, загрузи отчет о разработке и нажми кнопку анализ для проведения качественного анализа отчета или продолжи общение со мной в чате.",
     "file_uploaded": "Файл с именем {filename} загружен в чат!"
 }
+
+def _parse_file_names(files_json: Optional[str]) -> list[str]:
+    """Принимает JSON-строку со списком: ['a.pdf'] или [{'name': 'a.pdf'}]"""
+    if not files_json:
+        return []
+    try:
+        data = json.loads(files_json)
+        out: list[str] = []
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, str):
+                    out.append(item)
+                elif isinstance(item, dict) and "name" in item and isinstance(item["name"], str):
+                    out.append(item["name"])
+        return out
+    except Exception:
+        return []
 
 async def generate_agent_response(message: str, chat_id: str, has_files: bool = False) -> str:
     """Генерация ответа агента (заглушка)"""
@@ -55,8 +76,46 @@ async def stream_response(text: str):
     
     yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
 
+
 @app.post("/api/chat")
 async def chat_endpoint(
+    chat_id: str = Form(...),
+    message: str = Form(...),
+    files: Optional[str] = Form(None)
+):
+    """Стрим ответа агента в SSE."""
+    try:
+        file_names = _parse_file_names(files)
+        inputs = {
+            "messages": [HumanMessage(content=message)],
+            "chat_id": chat_id,
+            "file_names": file_names,
+        }
+        config = {"configurable": {"thread_id": chat_id}}
+
+        async def event_iter():
+            # stream_mode="messages" — токены LLM + метаданные узла
+            async for chunk, meta in APP.astream(inputs, config=config, stream_mode="messages"):
+                node = (meta or {}).get("langgraph_node")
+                if node not in TARGET_NODES:
+                    continue
+                if isinstance(chunk, AIMessageChunk):
+                    # пропускаем чанки с tool_call_chunks (вызовы инструментов)
+                    if getattr(chunk, "tool_call_chunks", None):
+                        continue
+                    piece = (chunk.content or "").strip("\n")
+                    if piece:
+                        yield {"data": json.dumps({"content": piece, "done": False})}
+            # финальный маркер
+            yield {"data": json.dumps({"content": "", "done": True})}
+
+        return EventSourceResponse(event_iter(), ping=15000)  # text/event-stream
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/chat_mock")
+async def chat_endpoint_mock(
     chat_id: str = Form(...),
     message: str = Form(...),
     files: Optional[str] = Form(None)  # JSON строка с файлами чата
@@ -93,17 +152,13 @@ async def upload_file(
         # Сохраняем файл в общую папку uploads
         file_path = UPLOADS_DIR / file.filename
         
-        # Если файл уже существует, добавляем timestamp к имени
+        # Если файл уже существует, считаем что он уже загружен
         if file_path.exists():
-            name, ext = os.path.splitext(file.filename)
-            timestamp = int(time.time())
-            new_filename = f"{name}_{timestamp}{ext}"
-            file_path = UPLOADS_DIR / new_filename
+            new_filename = file.filename
         else:
             new_filename = file.filename
-        
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
         
         # Возвращаем информацию о файле
         return {

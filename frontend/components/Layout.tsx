@@ -109,7 +109,7 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
       
       <main 
         className={`flex-1 transition-all duration-300 ${
-          isSidebarOpen ? 'ml-80' : 'ml-0'
+          isSidebarOpen ? 'ml-80' : 'ml-16'
         }`}
       >
         {children}
