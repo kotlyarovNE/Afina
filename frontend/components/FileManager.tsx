@@ -135,6 +135,12 @@ const FileManager: React.FC<FileManagerProps> = ({
           [fileName]: [...(prev[fileName] || []), chatId]
         }));
       }
+      
+      // Уведомляем другие компоненты об изменении файлов в чате
+      window.dispatchEvent(new CustomEvent('chatUpdated', { 
+        detail: { chatId } 
+      }));
+      
     } catch (error) {
       console.error('Ошибка привязки файла к чату:', error);
     }

@@ -90,6 +90,11 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
     try {
       await updateChatStorage(updatedChat);
       await loadChats(); // Перезагружаем список чатов
+      
+      // Уведомляем другие компоненты об изменении
+      window.dispatchEvent(new CustomEvent('chatUpdated', { 
+        detail: { chatId: updatedChat.id } 
+      }));
     } catch (error) {
       console.error('Ошибка обновления чата:', error);
     }

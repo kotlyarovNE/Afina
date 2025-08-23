@@ -34,6 +34,21 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
     loadChatData();
   }, [chat.id]);
 
+  // Слушаем события обновления чата
+  useEffect(() => {
+    const handleChatUpdate = (event: CustomEvent) => {
+      if (event.detail.chatId === chat.id) {
+        loadChatData(); // Перезагружаем данные чата
+      }
+    };
+
+    window.addEventListener('chatUpdated', handleChatUpdate as EventListener);
+    
+    return () => {
+      window.removeEventListener('chatUpdated', handleChatUpdate as EventListener);
+    };
+  }, [chat.id]);
+
   // Периодическое обновление данных чата для отображения потоковых сообщений
   useEffect(() => {
     if (!isAgentTyping) return;
@@ -231,6 +246,11 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
       const { removeFileFromChat: removeFile } = await import('../utils/storage');
       await removeFile(chat.id, fileName);
       await loadChatData(); // Перезагружаем данные чата
+      
+      // Уведомляем другие компоненты об изменении
+      window.dispatchEvent(new CustomEvent('chatUpdated', { 
+        detail: { chatId: chat.id } 
+      }));
     } catch (error) {
       console.error('Ошибка удаления файла из чата:', error);
     }
