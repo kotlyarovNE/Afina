@@ -4,14 +4,19 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
-import asyncio, json, shutil
+import asyncio
+import json
+import shutil
 from typing import Optional
-from pathlib import Path
 
+# какие ноды отрисовываем на фронте
+from .agent.agent import TARGET_NODES
 from .agent.agent import APP, HumanMessage
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessageChunk, AIMessage
+from .monitoring import monitor_llm_calls
 
 app = FastAPI(title="Afina Chat API")
 
@@ -27,14 +32,14 @@ app.add_middleware(
 # Создание папки uploads если её нет
 UPLOADS_DIR = Path("app/uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
-TARGET_NODES = {"assistant", "analyze_report"}  # какие ноды отрисовываем на фронте
 
 
 # Заглушка для агента Afina
 AGENT_RESPONSES = {
     "default": "Привет я помощник Afina, загрузи отчет о разработке и нажми кнопку анализ для проведения качественного анализа отчета или продолжи общение со мной в чате.",
-    "file_uploaded": "Файл с именем {filename} загружен в чат!"
+    "file_uploaded": "Файл с именем {filename} загружен в чат!",
 }
+
 
 def _parse_file_names(files_json: Optional[str]) -> list[str]:
     """Принимает JSON-строку со списком: ['a.pdf'] или [{'name': 'a.pdf'}]"""
@@ -47,20 +52,30 @@ def _parse_file_names(files_json: Optional[str]) -> list[str]:
             for item in data:
                 if isinstance(item, str):
                     out.append(item)
-                elif isinstance(item, dict) and "name" in item and isinstance(item["name"], str):
+                elif (
+                    isinstance(item, dict)
+                    and "name" in item
+                    and isinstance(item["name"], str)
+                ):
                     out.append(item["name"])
         return out
     except Exception:
         return []
 
-async def generate_agent_response(message: str, chat_id: str, has_files: bool = False) -> str:
+
+async def generate_agent_response(
+    message: str, chat_id: str, has_files: bool = False
+) -> str:
     """Генерация ответа агента (заглушка)"""
-    if has_files and any(keyword in message.lower() for keyword in ["анализ", "файл", "отчет"]):
+    if has_files and any(
+        keyword in message.lower() for keyword in ["анализ", "файл", "отчет"]
+    ):
         return "Отлично! Я вижу, что у нас есть загруженные файлы. Начинаю анализ документов... Пожалуйста, подождите немного, пока я изучу содержимое."
     elif "привет" in message.lower() or "hello" in message.lower():
         return "Привет! Я Afina, ваш интеллектуальный помощник. Чем могу помочь?"
     else:
         return AGENT_RESPONSES["default"]
+
 
 async def stream_response(text: str):
     """Потоковая отправка ответа с имитацией печати"""
@@ -70,18 +85,19 @@ async def stream_response(text: str):
             chunk = word
         else:
             chunk = " " + word
-        
+
         yield f"data: {json.dumps({'content': chunk, 'done': False})}\n\n"
         await asyncio.sleep(0.1)  # Задержка для имитации печати
-    
+
     yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
 
 
 @app.post("/api/chat")
+@monitor_llm_calls
 async def chat_endpoint(
     chat_id: str = Form(...),
     message: str = Form(...),
-    files: Optional[str] = Form(None)
+    files: Optional[str] = Form(None),
 ):
     """Стрим ответа агента в SSE."""
     try:
@@ -95,17 +111,35 @@ async def chat_endpoint(
 
         async def event_iter():
             # stream_mode="messages" — токены LLM + метаданные узла
-            async for chunk, meta in APP.astream(inputs, config=config, stream_mode="messages"):
+            async for chunk, meta in APP.astream(
+                inputs, config=config, stream_mode="messages"
+            ):
                 node = (meta or {}).get("langgraph_node")
                 if node not in TARGET_NODES:
                     continue
-                if isinstance(chunk, AIMessageChunk):
+                if isinstance(chunk, (AIMessageChunk, AIMessage)):
                     # пропускаем чанки с tool_call_chunks (вызовы инструментов)
-                    if getattr(chunk, "tool_call_chunks", None):
+                    if hasattr(chunk, "tool_call_chunks") and getattr(chunk, "tool_call_chunks", None):
                         continue
-                    piece = (chunk.content or "").strip("\n")
-                    if piece:
-                        yield {"data": json.dumps({"content": piece, "done": False})}
+                    
+                    content = chunk.content or ""
+                    
+                    # Если это полное AIMessage (не chunk), отправляем по словам для имитации печати
+                    if isinstance(chunk, AIMessage) and content.strip():
+                        words = content.split()
+                        for i, word in enumerate(words):
+                            if i == 0:
+                                piece = word
+                            else:
+                                piece = " " + word
+                            yield {"data": json.dumps({"content": piece, "done": False})}
+                            # Небольшая задержка для плавной печати
+                            await asyncio.sleep(0.1)
+                    # Если это chunk, отправляем как есть
+                    elif isinstance(chunk, AIMessageChunk):
+                        piece = content.strip("\n")
+                        if piece:
+                            yield {"data": json.dumps({"content": piece, "done": False})}
             # финальный маркер
             yield {"data": json.dumps({"content": "", "done": True})}
 
@@ -118,7 +152,7 @@ async def chat_endpoint(
 async def chat_endpoint_mock(
     chat_id: str = Form(...),
     message: str = Form(...),
-    files: Optional[str] = Form(None)  # JSON строка с файлами чата
+    files: Optional[str] = Form(None),  # JSON строка с файлами чата
 ):
     """Endpoint для отправки сообщений в чат"""
     try:
@@ -127,31 +161,30 @@ async def chat_endpoint_mock(
         if files:
             file_list = json.loads(files)
             has_files = len(file_list) > 0
-        
+
         # Генерируем ответ
         response_text = await generate_agent_response(message, chat_id, has_files)
-        
+
         return StreamingResponse(
             stream_response(response_text),
             media_type="text/plain",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                "Content-Type": "text/event-stream"
-            }
+                "Content-Type": "text/event-stream",
+            },
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/api/upload")
-async def upload_file(
-    file: UploadFile = File(...)
-):
+async def upload_file(file: UploadFile = File(...)):
     """Endpoint для загрузки файлов в общую папку uploads"""
     try:
         # Сохраняем файл в общую папку uploads
         file_path = UPLOADS_DIR / file.filename
-        
+
         # Если файл уже существует, считаем что он уже загружен
         if file_path.exists():
             new_filename = file.filename
@@ -159,7 +192,7 @@ async def upload_file(
             new_filename = file.filename
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
-        
+
         # Возвращаем информацию о файле
         return {
             "success": True,
@@ -167,11 +200,12 @@ async def upload_file(
             "original_filename": file.filename,
             "file_path": str(file_path),
             "size": file_path.stat().st_size,
-            "message": f"Файл {new_filename} успешно загружен!"
+            "message": f"Файл {new_filename} успешно загружен!",
         }
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка загрузки файла: {str(e)}")
+
 
 @app.get("/api/files")
 async def get_all_files():
@@ -179,24 +213,27 @@ async def get_all_files():
     try:
         if not UPLOADS_DIR.exists():
             return {"files": []}
-        
+
         files = []
         for file_path in UPLOADS_DIR.iterdir():
             if file_path.is_file():
-                files.append({
-                    "name": file_path.name,
-                    "size": file_path.stat().st_size,
-                    "uploaded_at": file_path.stat().st_mtime,
-                    "path": str(file_path)
-                })
-        
+                files.append(
+                    {
+                        "name": file_path.name,
+                        "size": file_path.stat().st_size,
+                        "uploaded_at": file_path.stat().st_mtime,
+                        "path": str(file_path),
+                    }
+                )
+
         # Сортируем по дате загрузки (новые первые)
         files.sort(key=lambda x: x["uploaded_at"], reverse=True)
-        
+
         return {"files": files}
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.delete("/api/files/{filename}")
 async def delete_file(filename: str):
@@ -211,11 +248,14 @@ async def delete_file(filename: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/api/health")
 async def health_check():
     """Проверка работоспособности API"""
     return {"status": "ok", "message": "Afina API работает"}
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

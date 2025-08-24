@@ -1,185 +1,340 @@
-# app/agent/agent.py
+# backend/app/agent/agent.py
+
 from __future__ import annotations
-from typing import TypedDict, Annotated, Sequence, Optional, Literal
+
+from typing import Annotated, Dict, List, TypedDict, Any
 from pathlib import Path
 
-from ddgs import DDGS
-from langchain_core.tools import tool
-from langchain_core.messages import (
-    AnyMessage, AIMessage, HumanMessage, SystemMessage
-)
-from langchain_core.runnables import RunnableConfig
-from langchain_openai import ChatOpenAI
-
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import InMemorySaver
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    AIMessage,
+    ToolMessage
+)
+from langchain.tools import tool
 from langgraph.prebuilt import ToolNode
 
-# ---------- 0) Пути ----------
-# .../app/agent/agent.py -> BASE_DIR = .../app
-BASE_DIR = Path(__file__).resolve().parents[1]
-UPLOADS_DIR = BASE_DIR / "uploads"
+from .utils.file_loader import load_files
+from .nodes.route import classify_intent, is_affirmative
+from .nodes.report_analyse import run_report_analysis
+from .nodes.report_helper import answer_about_last_report
+from .nodes.general_assistant import build_general_assistant_llm
 
-# ---------- 1) Инструмент поиска ----------
-@tool("search_web", return_direct=False)
+
+# ── Settings ───────────────────────────────────────────────────────────────
+DEFAULT_MODEL = "gpt-4o-mini"  # override via env OPENAI_API_KEY
+ANALYST_MODEL = "gpt-4o"  # for the heavy analysis node
+
+UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
+
+
+# ── Tools (DuckDuckGo search) ──────────────────────────────────────────────
+try:
+    from ddgs import DDGS
+except Exception:  # pragma: no cover
+    DDGS = None
+
+
+@tool("search_web", description="Ищет в DuckDuckGo (RU, неделя, 5 ссылок)")
 def search_web(query: str, max_results: int = 5) -> str:
-    """Ищет в DuckDuckGo (регион ru-ru, период — неделя) и
-    возвращает до max_results строк в формате: 'title: snippet -- url'."""
+    if DDGS is None:
+        return "Поиск недоступен: не установлен пакет `ddgs`. Установите `pip install ddgs`"
     with DDGS() as ddgs:
         hits = ddgs.text(query, region="ru-ru", time="w", max_results=max_results)
-        lines = []
-        for hit in hits[:max_results]:
-            title = hit.get("title", "").strip()
-            body = hit.get("body", "").strip()
-            href = hit.get("href", "").strip()
-            lines.append(f"{title}: {body} -- {href}")
-        return "\n".join(lines)
+        rows = []
+        for h in hits[:max_results]:
+            title = h.get("title", "")
+            body = h.get("body", "")
+            href = h.get("href", "")
+            rows.append(f"{title}: {body} -- {href}")
+        return "\n".join(rows)
+
 
 TOOLS = [search_web]
+TOOLS_NODE = ToolNode(TOOLS)
 
-# ---------- 2) Схема состояния ----------
-class AgentState(TypedDict):
-    messages: Annotated[Sequence[AnyMessage], add_messages]
+
+# ── State definition ───────────────────────────────────────────────────────
+class AgentState(TypedDict, total=False):
+    # Core chat log (we append via the add_messages reducer)
+    messages: Annotated[List[BaseMessage], add_messages]
+
+    # Parsed files content (filename -> text)
+    files: Dict[str, str]
+
+    # Hash cache for uploaded files (filename -> sha256)
+    files_hashes: Dict[str, str]
+
+    # The incoming chat_id (used by checkpointer threading)
     chat_id: str
-    analysis_summary: Optional[str]
-    branch: Optional[Literal["analyze", "general"]]
-    file_names: Optional[Sequence[str]]         # NEW
 
-# ---------- 3) LLM и системные подсказки ----------
-assistant_llm = ChatOpenAI(model="gpt-4o", temperature=0).bind_tools(TOOLS)
+    # The raw file names provided on each request
+    file_names: List[str]
 
-SYSTEM_GENERAL = (
-    "Ты полезный ассистент. Отвечай кратко и по делу. "
-    "Если пользователь явно просит «поищи в интернете», используй инструмент search_web. "
-    "Если не уверен в фактах, предложи поиск (search_web), а затем дай ответ на основе найденного."
-)
+    # Memo of the last analysis
+    last_report: Dict[str, Any] | None
 
-SYSTEM_ANALYZE = (
-    "Ты эксперт по ревью отчётов о разработке ML/DS моделей. "
-    "Твоя задача — провести качественную проверку по загруженным документам.\n\n"
-    "Проверь 3 вещи и ответь структурировано:\n"
-    "1) Детально ли задокументированы параметры модели в отчёте?\n"
-    "2) Есть ли ограничения у модели в отчёте?\n"
-    "3) Прописана ли степень значимости у модели?\n\n"
-    "Используй ТОЛЬКО предоставленное содержимое файлов (если они есть). "
-    "Если информации не хватает — честно напиши, чего именно не хватает."
-)
+    # Whether we previously asked the user to run an analysis first
+    clarification_required: bool
 
-# ---------- 4) Утилиты ----------
-ALLOWED_EXT = {
-    ".txt", ".md", ".markdown", ".log", ".json", ".csv", ".tsv", ".yaml", ".yml",
-    ".pdf", ".docx", ".xlsx", ".pptx"  # бинарники отметим как [skip], если без парсеров
-}
+    # Internal: the routing label computed in the router
+    route_label: str
 
-def load_corpus_by_names(file_names: Sequence[str] | None, max_chars: int = 40_000) -> str:
-    """Собираем текст только из указанных файлов в app/uploads."""
-    if not file_names:
-        return ""
-    buf, acc = [], 0
-    for name in file_names:
-        p = UPLOADS_DIR / name
-        if not (p.exists() and p.is_file()):
-            continue
-        ext = p.suffix.lower()
-        text = ""
-        try:
-            if ext == ".pdf":
-                try:
-                    from pypdf import PdfReader  # pip install pypdf
-                    text = ""
-                    reader = PdfReader(str(p))
-                    for page in reader.pages:
-                        text += page.extract_text() or ""
-                except Exception:
-                    text = f"[skip pdf: {p.name}]"
-            elif ext in {".docx", ".xlsx", ".pptx"}:
-                # Можно подключить: python-docx, openpyxl, python-pptx
-                text = f"[skip binary: {p.name}]"
-            elif ext in ALLOWED_EXT:
-                text = p.read_text(encoding="utf-8", errors="ignore")
-            else:
-                text = f"[skip unsupported: {p.name}]"
-        except Exception:
-            text = f"[skip error: {p.name}]"
 
-        if text:
-            part = f"\n\n==== FILE: {p.name} ====\n{text}"
-            buf.append(part)
-            acc += len(part)
-            if acc >= max_chars:
-                break
-    return ("" if not buf else "".join(buf))[:max_chars]
+# ── LLMs ───────────────────────────────────────────────────────────────────
+router_llm = ChatOpenAI(model=DEFAULT_MODEL, temperature=0, streaming=True)
+assistant_llm = build_general_assistant_llm(DEFAULT_MODEL)  # with tools bound in node
+analyst_llm = ChatOpenAI(model=ANALYST_MODEL, temperature=0, streaming=True)
 
-def is_quality_analysis_request(user_text: str) -> bool:
-    t = user_text.lower()
-    return (
-        ("анализ" in t)
-    )
 
-# ---------- 5) Ноды графа ----------
-def route_node(state: AgentState) -> AgentState:
-    msgs = state["messages"]
-    last_user = next((m for m in reversed(msgs) if isinstance(m, HumanMessage)), None)
-    txt = last_user.content if last_user else ""
-    branch: Literal["analyze", "general"] = (
-        "analyze" if is_quality_analysis_request(txt) else "general"
-    )
-    return {"branch": branch}
+# ── Nodes ──────────────────────────────────────────────────────────────────
 
-def analyze_report_node(state: AgentState) -> AgentState:
+
+def route_node(state: AgentState) -> Dict[str, Any]:
+    """Router node: updates files cache if needed and decides where to go next.
+
+    Returns partial state updates (e.g. files, files_hashes, messages, route_label, clarification_required).
+    """
+    updates: Dict[str, Any] = {}
+
+    # 0) ensure keys
     file_names = state.get("file_names") or []
-    corpus = load_corpus_by_names(file_names)
-    last_user = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
-    question = last_user.content if last_user else ""
+    print("file_names: ", file_names)
+    print("uploads_dir: ", UPLOADS_DIR)
+    print("uploads_dir exists: ", UPLOADS_DIR.exists())
+    print("uploads_dir contents: ", list(UPLOADS_DIR.iterdir()) if UPLOADS_DIR.exists() else "DIR_NOT_FOUND")
+    last_report = state.get("last_report")
+    clarification_required = state.get("clarification_required", False)
 
-    sys = SYSTEM_ANALYZE + "\n\n[Вложенные материалы]\n" + (corpus or "(файлов нет)")
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    ai = llm.invoke([SystemMessage(content=sys), HumanMessage(content=question)])
-    answer_msg = ai if isinstance(ai, AIMessage) else AIMessage(content=str(ai))
+    # 1) Keep files in state always current (with caching by hashes)
+    if not file_names:
+        # Explicitly clear if no files provided
+        if state.get("files"):
+            updates["files"] = {}
+            updates["files_hashes"] = {}
+    else:
+        new_files, new_hashes, changed = load_files(
+            file_names=file_names,
+            uploads_dir=UPLOADS_DIR,
+            prev_hashes=state.get("files_hashes") or {},
+        )
+        if changed:
+            updates["files"] = new_files
+            updates["files_hashes"] = new_hashes
 
-    return {
-        "messages": [answer_msg],
-        "analysis_summary": "done" if answer_msg.content else None,
+    # 2) Inspect the latest user message
+    # We assume the request already appended HumanMessage(message) in inputs
+    user_text = ""
+    for msg in reversed(state.get("messages", [])):
+        if isinstance(msg, HumanMessage):
+            user_text = str(msg.content)
+            break
+
+    # 3) If we previously asked for confirmation — check if the user agreed
+    if clarification_required:
+        if user_text:
+            confirm = is_affirmative(router_llm, user_text)
+            if confirm:
+                if not file_names:
+                    # user wants analysis but there are no files
+                    updates["messages"] = [
+                        AIMessage(
+                            content="Файлов в чате не найдено, загрузите файлы для анализа."
+                        )
+                    ]
+                    updates["route_label"] = "end"
+                    return updates
+                updates["clarification_required"] = False
+                updates["route_label"] = "report_analyse"
+                return updates
+        # If not affirmative, just proceed to normal routing below (keep the flag as-is)
+
+    # 4) Main routing
+    intent = classify_intent(router_llm, user_text)
+
+    if intent == "ANALYZE":
+        if not file_names:
+            updates["messages"] = [
+                AIMessage(
+                    content="Файлов в чате не найдено, загрузите файлы для анализа."
+                ),
+            ]
+            updates["route_label"] = "end"
+            return updates
+        updates["route_label"] = "report_analyse"
+        return updates
+
+    if intent == "ASK_PREV_REPORT":
+        if last_report:
+            updates["route_label"] = "report_helper"
+            return updates
+        else:
+            updates["clarification_required"] = True
+            updates["messages"] = [
+                AIMessage(
+                    content=(
+                        "Простите, качественный анализ отчёта в данном чате ещё не проводился. "
+                        "Сначала запустите анализ. Хотите это сделать?"
+                    )
+                )
+            ]
+            updates["route_label"] = "end"
+            return updates
+
+    # Default — general questions
+    updates["route_label"] = "general_assistant"
+    return updates
+
+
+def route_edges(state: AgentState) -> str:
+    return state.get("route_label", "general_assistant")
+
+
+# report_analyse node wrapper
+
+
+def report_analyse_node(state: AgentState) -> Dict[str, Any]:
+    files = state.get("files") or {}
+    # Last user text (the question that triggered analysis)
+    user_text = ""
+    for msg in reversed(state.get("messages", [])):
+        if isinstance(msg, HumanMessage):
+            user_text = str(msg.content)
+            break
+
+    md_table, llm_prompt_snapshot = run_report_analysis(
+        analyst_llm=analyst_llm,
+        files=files,
+        user_question=user_text,
+    )
+
+    # Persist last_report memo
+    last_report = {
+        "msg": {
+            "user_client": user_text,
+            "user_analyse": llm_prompt_snapshot,
+            "assistant": md_table,
+        },
+        "files": files,
     }
 
-def assistant_node(state: AgentState, config: RunnableConfig) -> AgentState:
-    msgs: list[AnyMessage] = [SystemMessage(content=SYSTEM_GENERAL), *state["messages"]]
-    ai = assistant_llm.invoke(msgs, config=config)
-    return {"messages": [ai]}
+    return {
+        "messages": [AIMessage(content=md_table)],
+        "last_report": last_report,
+        "clarification_required": False,
+    }
 
-tools_node = ToolNode(TOOLS)
+
+# report_helper node wrapper
+
+
+def report_helper_node(state: AgentState) -> Dict[str, Any]:
+    # Gather small context: last 2 messages from chat, plus last_report pair
+    history = [
+        m for m in state.get("messages", []) if isinstance(m, (HumanMessage, AIMessage))
+    ]
+    last_two = history[-2:] if len(history) >= 2 else history
+
+    last_report = state.get("last_report") or {}
+    lr_user = (last_report.get("msg", {}) or {}).get("user_analyse", "")
+    lr_assistant = (last_report.get("msg", {}) or {}).get("assistant", "")
+
+    reply = answer_about_last_report(
+        llm=router_llm,
+        short_history=last_two,
+        last_report_user=lr_user,
+        last_report_assistant=lr_assistant,
+    )
+
+    return {"messages": [AIMessage(content=reply)]}
+
+
+# general assistant node (tool-aware)
+
+
+def general_assistant_node(state: AgentState) -> Dict[str, Any]:
+    # Берём сырой хвост истории (включая ToolMessage), чтобы не оборвать пары tool_calls → tool
+    msgs = state.get("messages", [])
+    print("msgs: ", msgs)
+    ctx = msgs[-6:]  # небольшое окно контекста
+    #print("ctx: ", ctx)
+    # Санитизация: не допускаем assistant(tool_calls) без следующего tool(...)
+    sanitized: List[BaseMessage] = []
+    i = 0
+    while i < len(ctx):
+        m = ctx[i]
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            if i + 1 < len(ctx) and isinstance(ctx[i + 1], ToolMessage):
+                sanitized.append(m)
+                sanitized.append(ctx[i + 1])
+                i += 2
+                continue
+            # если пара разорвана (следующего tool нет в окне) — пропускаем это AI-сообщение
+            i += 1
+            continue
+        sanitized.append(m)
+        i += 1
+
+    llm = build_general_assistant_llm(DEFAULT_MODEL).bind_tools(TOOLS)
+    #print("general response: ", sanitized, "\n")
+    response = llm.invoke(sanitized)
+    return {"messages": [response]}
+
+
 
 def should_continue(state: AgentState) -> str:
-    last = state["messages"][-1]
+    # If the last assistant message has tool_calls — go to ToolNode
+    msgs = state.get("messages", [])
+    if not msgs:
+        return "end"
+    last = msgs[-1]
     if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
         return "tools"
     return "end"
 
-# ---------- 6) Сборка графа ----------
-def build_app():
-    builder = StateGraph(AgentState)
-    builder.add_node("route", route_node)
-    builder.add_node("analyze_report", analyze_report_node)
-    builder.add_node("assistant", assistant_node)
-    builder.add_node("tools", tools_node)
 
-    builder.add_edge(START, "route")
-    builder.add_conditional_edges("route", lambda s: s["branch"],
-                                  {"analyze": "analyze_report", "general": "assistant"})
-    builder.add_conditional_edges("assistant", should_continue, {"tools": "tools", "end": END})
-    builder.add_edge("tools", "assistant")
-    builder.add_edge("analyze_report", END)
+# ── Build graph ────────────────────────────────────────────────────────────
+
+
+def build_app() -> Any:
+    builder = StateGraph(AgentState)
+
+    # Nodes
+    builder.add_node("route", route_node)
+    builder.add_node("report_analyse", report_analyse_node)
+    builder.add_node("report_helper", report_helper_node)
+    builder.add_node("general_assistant", general_assistant_node)
+    builder.add_node("tools", TOOLS_NODE)
+
+    # Edges
+    builder.add_conditional_edges(
+        "route",
+        route_edges,
+        {
+            "report_analyse": "report_analyse",
+            "report_helper": "report_helper",
+            "general_assistant": "general_assistant",
+            "end": END,
+        },
+    )
+
+    builder.add_conditional_edges(
+        "general_assistant", should_continue, {"tools": "tools", "end": END}
+    )
+    builder.add_edge("tools", "general_assistant")
+
+    builder.set_entry_point("route")
 
     checkpointer = InMemorySaver()
     return builder.compile(checkpointer=checkpointer)
 
-APP = build_app()
 
-# ---------- 7) опционально: синхронный вызов как раньше ----------
-def reply(chat_id: str, user_text: str, file_names: Sequence[str] | None = None):
-    config = {"configurable": {"thread_id": chat_id}}
-    return APP.invoke(
-        {"messages": [HumanMessage(content=user_text)], "chat_id": chat_id, "file_names": file_names or []},
-        config=config,
-    )
+# Exported app and SSE filter
+AFINA = build_app()
+APP = AFINA
+TARGET_NODES = {"report_analyse", "report_helper", "general_assistant", "route"}
