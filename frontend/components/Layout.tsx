@@ -101,7 +101,7 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
   };
 
   return (
-    <div className="flex h-screen bg-gray-50">
+    <div className="flex h-dvh min-h-0 bg-gray-50">
       <Sidebar
         isOpen={isSidebarOpen}
         onToggle={() => setIsSidebarOpen(!isSidebarOpen)}
@@ -113,7 +113,7 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
       />
       
       <main 
-        className={`flex-1 transition-all duration-300 ${
+        className={`flex-1 min-h-0 overflow-hidden transition-all duration-300 ${
           isSidebarOpen ? 'ml-80' : 'ml-16'
         }`}
       >
