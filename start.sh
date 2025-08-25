@@ -26,9 +26,8 @@ mitmweb \
 --set web_open_browser=false \
 --set stream_large_bodies=5m \
 --set web_password="${MITM_TOKEN}" \
---set view_filter='~m "(?i)POST" & ~d "(api\.openai\.com|api\.anthropic\.com|generativelanguage\.googleapis\.com|api\.mistral\.ai|openrouter\.ai|api\.perplexity\.ai|api\.together\.xyz)"' \
 > .mitmweb.log 2>&1 &
-
+#--set view_filter='~m "(?i)POST" & ~d "(api\.openai\.com|api\.anthropic\.com|generativelanguage\.googleapis\.com|api\.mistral\.ai|openrouter\.ai|api\.perplexity\.ai|api\.together\.xyz)"' \
 MITM_PID=$!
 
 # Немного подождать чтобы порт поднялся
