@@ -17,6 +17,13 @@ from .agent.agent import TARGET_NODES
 from .agent.agent import APP, HumanMessage
 from langchain_core.messages import AIMessageChunk, AIMessage
 
+# MIT Proxy для мониторинга
+try:
+    from ..monitoring.proxy_manager import get_manager
+    PROXY_AVAILABLE = True
+except ImportError:
+    PROXY_AVAILABLE = False
+
 app = FastAPI(title="Afina Chat API")
 
 # CORS настройки для frontend
@@ -251,6 +258,76 @@ async def delete_file(filename: str):
 async def health_check():
     """Проверка работоспособности API"""
     return {"status": "ok", "message": "Afina API работает"}
+
+
+# ── MIT Proxy Management ───────────────────────────────────────────────────
+
+@app.post("/api/proxy/start")
+async def proxy_start():
+    """Запуск MIT Proxy для мониторинга трафика"""
+    if not PROXY_AVAILABLE:
+        return {"success": False, "error": "MIT Proxy модуль недоступен"}
+    
+    try:
+        manager = get_manager()
+        started = manager.start(open_browser=True)
+        status = manager.get_status()
+        return {
+            "success": started,
+            "status": {
+                "is_running": status.is_running,
+                "pid": status.pid,
+                "web_url": status.web_url,
+                "proxy_url": status.proxy_url,
+                "web_port": status.web_port,
+                "proxy_port": status.proxy_port
+            }
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/proxy/stop")
+async def proxy_stop():
+    """Остановка MIT Proxy"""
+    if not PROXY_AVAILABLE:
+        return {"success": False, "error": "MIT Proxy модуль недоступен"}
+    
+    try:
+        manager = get_manager()
+        stopped = manager.stop()
+        status = manager.get_status()
+        return {
+            "success": stopped,
+            "status": {
+                "is_running": status.is_running,
+                "pid": status.pid
+            }
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/proxy/status")
+async def proxy_status():
+    """Получение статуса MIT Proxy"""
+    if not PROXY_AVAILABLE:
+        return {"available": False, "error": "MIT Proxy модуль недоступен"}
+    
+    try:
+        manager = get_manager()
+        status = manager.get_status()
+        return {
+            "available": True,
+            "is_running": status.is_running,
+            "pid": status.pid,
+            "web_url": status.web_url,
+            "proxy_url": status.proxy_url,
+            "web_port": status.web_port,
+            "proxy_port": status.proxy_port
+        }
+    except Exception as e:
+        return {"available": True, "error": str(e)}
 
 
 if __name__ == "__main__":
