@@ -16,7 +16,6 @@ from typing import Optional
 from .agent.agent import TARGET_NODES
 from .agent.agent import APP, HumanMessage
 from langchain_core.messages import AIMessageChunk, AIMessage
-from .monitoring import monitor_llm_calls
 
 app = FastAPI(title="Afina Chat API")
 
@@ -93,7 +92,6 @@ async def stream_response(text: str):
 
 
 @app.post("/api/chat")
-@monitor_llm_calls
 async def chat_endpoint(
     chat_id: str = Form(...),
     message: str = Form(...),
