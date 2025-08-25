@@ -104,10 +104,10 @@ def route_node(state: AgentState) -> Dict[str, Any]:
 
     # 0) ensure keys
     file_names = state.get("file_names") or []
-    print("file_names: ", file_names)
-    print("uploads_dir: ", UPLOADS_DIR)
-    print("uploads_dir exists: ", UPLOADS_DIR.exists())
-    print("uploads_dir contents: ", list(UPLOADS_DIR.iterdir()) if UPLOADS_DIR.exists() else "DIR_NOT_FOUND")
+    #print("file_names: ", file_names)
+    #print("uploads_dir: ", UPLOADS_DIR)
+    #print("uploads_dir exists: ", UPLOADS_DIR.exists())
+    #print("uploads_dir contents: ", list(UPLOADS_DIR.iterdir()) if UPLOADS_DIR.exists() else "DIR_NOT_FOUND")
     last_report = state.get("last_report")
     clarification_required = state.get("clarification_required", False)
 
@@ -144,7 +144,8 @@ def route_node(state: AgentState) -> Dict[str, Any]:
                     # user wants analysis but there are no files
                     updates["messages"] = [
                         AIMessage(
-                            content="Файлов в чате не найдено, загрузите файлы для анализа."
+                            content="Файлов в чате не найдено, загрузите файлы для анализа.",
+                            response_metadata={"display": True, "NODE_NAME": "route_node"}
                         )
                     ]
                     updates["route_label"] = "end"
@@ -161,7 +162,8 @@ def route_node(state: AgentState) -> Dict[str, Any]:
         if not file_names:
             updates["messages"] = [
                 AIMessage(
-                    content="Файлов в чате не найдено, загрузите файлы для анализа."
+                    content="Файлов в чате не найдено, загрузите файлы для анализа.",
+                    response_metadata={"display": True, "NODE_NAME": "route_node"}
                 ),
             ]
             updates["route_label"] = "end"
@@ -180,7 +182,8 @@ def route_node(state: AgentState) -> Dict[str, Any]:
                     content=(
                         "Простите, качественный анализ отчёта в данном чате ещё не проводился. "
                         "Сначала запустите анализ. Хотите это сделать?"
-                    )
+                    ),
+                    response_metadata={"display": True, "NODE_NAME": "route_node"}
                 )
             ]
             updates["route_label"] = "end"
@@ -224,7 +227,7 @@ def report_analyse_node(state: AgentState) -> Dict[str, Any]:
     }
 
     return {
-        "messages": [AIMessage(content=md_table)],
+        "messages": [AIMessage(content=md_table, response_metadata={"display": True, "NODE_NAME": "analyse_node"})],
         "last_report": last_report,
         "clarification_required": False,
     }
@@ -251,7 +254,7 @@ def report_helper_node(state: AgentState) -> Dict[str, Any]:
         last_report_assistant=lr_assistant,
     )
 
-    return {"messages": [AIMessage(content=reply)]}
+    return {"messages": [AIMessage(content=reply, response_metadata={"display": True, "NODE_NAME": "helper_node"})]}
 
 
 # general assistant node (tool-aware)
@@ -260,7 +263,7 @@ def report_helper_node(state: AgentState) -> Dict[str, Any]:
 def general_assistant_node(state: AgentState) -> Dict[str, Any]:
     # Берём сырой хвост истории (включая ToolMessage), чтобы не оборвать пары tool_calls → tool
     msgs = state.get("messages", [])
-    print("msgs: ", msgs)
+    #print("msgs: ", msgs)
     ctx = msgs[-6:]  # небольшое окно контекста
     #print("ctx: ", ctx)
     # Санитизация: не допускаем assistant(tool_calls) без следующего tool(...)
@@ -280,9 +283,14 @@ def general_assistant_node(state: AgentState) -> Dict[str, Any]:
         sanitized.append(m)
         i += 1
 
-    llm = build_general_assistant_llm(DEFAULT_MODEL).bind_tools(TOOLS)
+    llm = (
+        build_general_assistant_llm(DEFAULT_MODEL)
+        .bind_tools(TOOLS)
+        .with_config(metadata={"display": True})
+    )
     #print("general response: ", sanitized, "\n")
     response = llm.invoke(sanitized)
+    response.response_metadata = {**getattr(response, "response_metadata", {}), "display": True, "NODE_NAME": "general_node"}
     return {"messages": [response]}
 
 

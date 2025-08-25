@@ -4,18 +4,15 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import StreamingResponse
+
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 import asyncio
 import json
 import shutil
 from typing import Optional
-
 # какие ноды отрисовываем на фронте
-from .agent.agent import TARGET_NODES
 from .agent.agent import APP, HumanMessage
-from langchain_core.messages import AIMessageChunk, AIMessage
 
 app = FastAPI(title="Afina Chat API")
 
@@ -62,42 +59,23 @@ def _parse_file_names(files_json: Optional[str]) -> list[str]:
         return []
 
 
-async def generate_agent_response(
-    message: str, chat_id: str, has_files: bool = False
-) -> str:
-    """Генерация ответа агента (заглушка)"""
-    if has_files and any(
-        keyword in message.lower() for keyword in ["анализ", "файл", "отчет"]
-    ):
-        return "Отлично! Я вижу, что у нас есть загруженные файлы. Начинаю анализ документов... Пожалуйста, подождите немного, пока я изучу содержимое."
-    elif "привет" in message.lower() or "hello" in message.lower():
-        return "Привет! Я Afina, ваш интеллектуальный помощник. Чем могу помочь?"
-    else:
-        return AGENT_RESPONSES["default"]
-
-
-async def stream_response(text: str):
-    """Потоковая отправка ответа с имитацией печати"""
-    words = text.split()
-    for i, word in enumerate(words):
-        if i == 0:
-            chunk = word
-        else:
-            chunk = " " + word
-
-        yield f"data: {json.dumps({'content': chunk, 'done': False})}\n\n"
-        await asyncio.sleep(0.1)  # Задержка для имитации печати
-
-    yield f"data: {json.dumps({'content': '', 'done': True})}\n\n"
-
-
 @app.post("/api/chat")
-async def chat_endpoint(
+async def chat_endpoint_post(
     chat_id: str = Form(...),
     message: str = Form(...),
     files: Optional[str] = Form(None),
 ):
-    """Стрим ответа агента в SSE."""
+    return await _chat_handler(chat_id, message, files)
+
+@app.get("/api/chat")
+async def chat_endpoint_get(
+    chat_id: str,
+    message: str,
+    files: Optional[str] = None,
+):
+    return await _chat_handler(chat_id, message, files)
+
+async def _chat_handler(chat_id: str, message: str, files: Optional[str]):
     try:
         file_names = _parse_file_names(files)
         inputs = {
@@ -108,70 +86,68 @@ async def chat_endpoint(
         config = {"configurable": {"thread_id": chat_id}}
 
         async def event_iter():
-            # stream_mode="messages" — токены LLM + метаданные узла
-            async for chunk, meta in APP.astream(
-                inputs, config=config, stream_mode="messages"
-            ):
-                node = (meta or {}).get("langgraph_node")
-                if node not in TARGET_NODES:
+            streamed = set()  # храним (step, node) с отправленными токенами
+
+            async for ev in APP.astream_events(inputs, config=config, version="v2"):
+                evt = ev.get("event")
+                data = ev.get("data") or {}
+                meta = ev.get("metadata") or {}
+                node = meta.get("langgraph_node")
+                step = meta.get("langgraph_step")
+                key = (step, node)
+
+                # Игнорим граф-уровень (неинтересные)
+                if not node:
                     continue
-                if isinstance(chunk, (AIMessageChunk, AIMessage)):
-                    # пропускаем чанки с tool_call_chunks (вызовы инструментов)
-                    if hasattr(chunk, "tool_call_chunks") and getattr(chunk, "tool_call_chunks", None):
+
+                # 1) Токены LLM - стримим в реальном времени
+                if evt in ("on_chat_model_stream", "on_llm_stream"):
+                    chunk = data.get("chunk")
+                    text = getattr(chunk, "content", None) or data.get("content") or ""
+                    if text and meta.get("display"):
+                        streamed.add(key)
+                        yield {"data": json.dumps({"content": text, "done": False})}
+                        await asyncio.sleep(0.05)
+
+                        # Убираем задержку для мгновенной отправки
+
+
+                # 2) Финал LLM только если токенов не было (одним куском)
+                elif evt in ("on_chat_model_end", "on_llm_end", "on_message_end"):
+                    msg = data.get("output") or data.get("message")
+                    text = getattr(msg, "content", None) or ""
+                    display = meta.get("display") or getattr(msg, "response_metadata", {}).get("display")
+                    if text and display and key not in streamed:
+                        # Отправляем полное сообщение без искусственных задержек
+                        yield {"data": json.dumps({"content": text, "done": False})}
+                        await asyncio.sleep(0.05)
+
+                # 3) AIMessage от роутера / других нод (без LLM)
+                elif evt == "on_chain_stream":
+                    if key in streamed:
                         continue
-                    
-                    content = chunk.content or ""
-                    
-                    # Если это полное AIMessage (не chunk), отправляем по словам для имитации печати
-                    if isinstance(chunk, AIMessage) and content.strip():
-                        words = content.split()
-                        for i, word in enumerate(words):
-                            if i == 0:
-                                piece = word
-                            else:
-                                piece = " " + word
-                            yield {"data": json.dumps({"content": piece, "done": False})}
-                            # Небольшая задержка для плавной печати
-                            await asyncio.sleep(0.1)
-                    # Если это chunk, отправляем как есть
-                    elif isinstance(chunk, AIMessageChunk):
-                        piece = content.strip("\n")
-                        if piece:
-                            yield {"data": json.dumps({"content": piece, "done": False})}
-            # финальный маркер
+                    for m in (data.get("chunk") or {}).get("messages") or []:
+                        text = getattr(m, "content", "")
+                        display = getattr(m, "response_metadata", {}) or {}
+                        if text and display.get("display"):
+                            yield {"data": json.dumps({"content": text, "done": False})}
+                            await asyncio.sleep(0.05)
+
+            # финальный флаг окончания
             yield {"data": json.dumps({"content": "", "done": True})}
 
-        return EventSourceResponse(event_iter(), ping=15000)  # text/event-stream
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/chat_mock")
-async def chat_endpoint_mock(
-    chat_id: str = Form(...),
-    message: str = Form(...),
-    files: Optional[str] = Form(None),  # JSON строка с файлами чата
-):
-    """Endpoint для отправки сообщений в чат"""
-    try:
-        # Проверяем есть ли файлы в чате
-        has_files = False
-        if files:
-            file_list = json.loads(files)
-            has_files = len(file_list) > 0
-
-        # Генерируем ответ
-        response_text = await generate_agent_response(message, chat_id, has_files)
-
-        return StreamingResponse(
-            stream_response(response_text),
-            media_type="text/plain",
+        return EventSourceResponse(
+            event_iter(),
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                "Content-Type": "text/event-stream",
+                "X-Accel-Buffering": "no",  # Отключаем буферизацию в Nginx
             },
+            ping=15000
         )
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

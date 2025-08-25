@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { flushSync } from 'react-dom';
 import { Send, Files, X, Paperclip } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkMath from 'remark-math';
@@ -22,12 +23,11 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
   const [isExpanded, setIsExpanded] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatFiles, setChatFiles] = useState<ChatFile[]>([]);
-  const [typingBuffer, setTypingBuffer] = useState<string>('');
-  const [isDisplayingTyping, setIsDisplayingTyping] = useState(false);
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
-  const typingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const updateTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   // Загрузка данных чата при изменении chat.id
   useEffect(() => {
@@ -42,14 +42,49 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
       }
     };
 
+    const handleStreamUpdate = (event: CustomEvent) => {
+      if (event.detail.chatId === chat.id) {
+        const newContent = event.detail.content || '';
+        
+        // Очищаем предыдущий таймаут
+        if (updateTimeoutRef.current) {
+          clearTimeout(updateTimeoutRef.current);
+        }
+        
+        // НЕМЕДЛЕННОЕ обновление с минимальным дебаунсингом (1ms) для группировки быстрых обновлений
+        updateTimeoutRef.current = setTimeout(() => {
+          flushSync(() => {
+            setMessages(prev => {
+              if (prev.length === 0) return prev;
+              
+              const lastMessage = prev[prev.length - 1];
+              if (lastMessage.sender === 'agent') {
+                const updatedMessage = {
+                  ...lastMessage,
+                  content: newContent // Сразу устанавливаем весь контент
+                };
+                return [...prev.slice(0, -1), updatedMessage];
+              }
+              return prev;
+            });
+          });
+        }, 1); // Группируем очень быстрые обновления
+      }
+    };
+
     window.addEventListener('chatUpdated', handleChatUpdate as EventListener);
+    window.addEventListener('chatStreamUpdate', handleStreamUpdate as EventListener);
     
     return () => {
       window.removeEventListener('chatUpdated', handleChatUpdate as EventListener);
+      window.removeEventListener('chatStreamUpdate', handleStreamUpdate as EventListener);
+      if (updateTimeoutRef.current) {
+        clearTimeout(updateTimeoutRef.current);
+      }
     };
   }, [chat.id]);
 
-  // Периодическое обновление данных чата для отображения потоковых сообщений
+  // Резервная проверка завершения печати (если события не сработали)
   useEffect(() => {
     if (!isAgentTyping) return;
     
@@ -57,49 +92,23 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
       const chatData = await getChatData(chat.id);
       const files = await getChatFiles(chat.id);
       
-      // Проверяем последнее сообщение агента
+      // Только проверяем появление новых сообщений, не обновляем содержимое
       const lastMessage = chatData.messages[chatData.messages.length - 1];
       if (lastMessage && lastMessage.sender === 'agent') {
         const currentLastMessage = messages[messages.length - 1];
         
-        // Если содержимое изменилось, запускаем плавную печать
-        if (currentLastMessage && currentLastMessage.id === lastMessage.id) {
-          
-          // Определяем новый текст для добавления
-          const newContent = lastMessage.content;
-          const currentContent = currentLastMessage.content;
-          const bufferedLength = typingBuffer.length;
-          
-          // Учитываем текст в буфере при сравнении
-          const totalCurrentLength = currentContent.length + bufferedLength;
-          
-          if (newContent.length > totalCurrentLength) {
-            const additionalText = newContent.slice(totalCurrentLength);
-            setTypingBuffer(prev => prev + additionalText);
-            
-            if (!isDisplayingTyping) {
-              startTypingAnimation();
-            }
-          }
-        } else if (!currentLastMessage || currentLastMessage.id !== lastMessage.id) {
-          // Новое сообщение от агента
+        if (!currentLastMessage || currentLastMessage.id !== lastMessage.id) {
+          // Новое сообщение от агента - загружаем полностью
           setMessages(chatData.messages);
           setChatFiles(files);
         }
       }
-    }, 300); // Проверяем обновления каждые 300ms
+    }, 2000); // Проверяем реже, так как основные обновления идут через события
 
     return () => clearInterval(interval);
-  }, [isAgentTyping, chat.id, messages, isDisplayingTyping, typingBuffer]);
+  }, [isAgentTyping, chat.id, messages]);
 
-  // Очистка интервала при размонтировании
-  useEffect(() => {
-    return () => {
-      if (typingIntervalRef.current) {
-        clearInterval(typingIntervalRef.current);
-      }
-    };
-  }, []);
+
 
   // Автоматический скролл к последнему сообщению
   useEffect(() => {
@@ -123,74 +132,24 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
     }
   }, [message]);
 
-  // Очистка анимации печати при остановке агента
+  // Финальная синхронизация при остановке агента
   useEffect(() => {
     if (!isAgentTyping) {
-      if (typingIntervalRef.current) {
-        clearInterval(typingIntervalRef.current);
-        typingIntervalRef.current = null;
-        setIsDisplayingTyping(false);
-      }
-      
-      // Если есть оставшийся буфер, добавляем его сразу
-      if (typingBuffer) {
-        updateLastMessageContent(typingBuffer);
-        setTypingBuffer('');
-      }
-      
-      // Когда агент закончил печатать, обновляем сообщения из хранилища
-      // чтобы убедиться что отображается полный текст
+      // Финальная синхронизация с localStorage
       setTimeout(() => {
         loadChatData();
       }, 100);
     }
-  }, [isAgentTyping, typingBuffer]);
+  }, [isAgentTyping]);
 
-  const startTypingAnimation = () => {
-    if (typingIntervalRef.current) return;
-    
-    setIsDisplayingTyping(true);
-    typingIntervalRef.current = setInterval(() => {
-      setTypingBuffer(prev => {
-        if (prev.length === 0) {
-          clearInterval(typingIntervalRef.current!);
-          typingIntervalRef.current = null;
-          setIsDisplayingTyping(false);
-          return prev;
-        }
-        
-        // Берем 1-3 символа для имитации реальной печати
-        const charsToAdd = Math.min(Math.floor(Math.random() * 3) + 1, prev.length);
-        const textToAdd = prev.slice(0, charsToAdd);
-        const remaining = prev.slice(charsToAdd);
-        
-        updateLastMessageContent(textToAdd);
-        return remaining;
-      });
-    }, 30); // Печатаем каждые 30ms для плавности
-  };
 
-  const updateLastMessageContent = (textToAdd: string) => {
-    setMessages(prev => {
-      if (prev.length === 0) return prev;
-      
-      const lastMessage = prev[prev.length - 1];
-      if (lastMessage.sender === 'agent') {
-        const updatedMessage = {
-          ...lastMessage,
-          content: lastMessage.content + textToAdd
-        };
-        
-        return [...prev.slice(0, -1), updatedMessage];
-      }
-      return prev;
-    });
-  };
 
   const loadChatData = async () => {
     try {
       const chatData = await getChatData(chat.id);
       const files = await getChatFiles(chat.id);
+      
+
       
       setMessages(chatData.messages);
       setChatFiles(files);

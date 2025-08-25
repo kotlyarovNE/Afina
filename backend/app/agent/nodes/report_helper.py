@@ -32,6 +32,7 @@ def answer_about_last_report(
     ]
 
     messages = [("system", system), ("user", intro + "\n\n" + "\n\n".join(user_blocks))]
-    print(messages)
+    #print(messages)
+    llm = llm.with_config(metadata={"display": True})
     resp = llm.invoke(messages)
     return str(resp.content)

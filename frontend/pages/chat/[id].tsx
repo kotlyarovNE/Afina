@@ -100,26 +100,6 @@ const ChatPage: React.FC = () => {
       await localforage.setItem(`${chatId}_typing_timestamp`, Date.now());
       setIsAgentTyping(true);
 
-      // Отправляем запрос на сервер
-      const formData = new FormData();
-      formData.append('chat_id', chatId);
-      formData.append('message', message);
-      formData.append('files', JSON.stringify(files));
-
-      const response = await fetch('http://localhost:8000/api/chat', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) {
-        throw new Error('Ошибка отправки сообщения');
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error('Нет потока ответа');
-      }
-
       // Создаем сообщение агента
       const agentMessage: Message = {
         id: `${chatId.replace('chat_', '')}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -131,44 +111,65 @@ const ChatPage: React.FC = () => {
       // Добавляем сообщение агента в хранилище
       await addMessageToChat(chatId, agentMessage);
 
-      // Читаем поток ответа
+      // ИСПОЛЬЗУЕМ НАТИВНЫЙ EventSource для НАСТОЯЩЕГО SSE без буферизации браузера!
+      const params = new URLSearchParams({
+        chat_id: chatId,
+        message: message,
+        files: JSON.stringify(files)
+      });
+      
+      const eventSource = new EventSource(`http://localhost:8000/api/chat?${params.toString()}`);
       let fullContent = '';
-      const decoder = new TextDecoder();
 
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          const chunk = decoder.decode(value);
-          const lines = chunk.split('\n');
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const data = JSON.parse(line.slice(6));
-                if (data.content) {
-                  fullContent += data.content;
-                  
-                  // Обновляем последнее сообщение в хранилище
-                  await updateLastMessage(chatId, fullContent);
-                }
-
-                if (data.done) {
-                  break;
-                }
-              } catch (e) {
-                console.error('Ошибка парсинга данных:', e);
-              }
-            }
+      eventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          
+          if (data.content) {
+            fullContent += data.content;
+            
+            // МГНОВЕННО уведомляем UI о новых данных (без await!)
+            window.dispatchEvent(new CustomEvent('chatStreamUpdate', { 
+              detail: { chatId, content: fullContent } 
+            }));
+            
+            // Асинхронно обновляем localStorage (не блокируем UI)
+            updateLastMessage(chatId, fullContent).catch(console.error);
+            localforage.setItem(`${chatId}_typing_timestamp`, Date.now()).catch(console.error);
           }
+
+          if (data.done) {
+            eventSource.close();
+            
+            // Убираем состояние печати
+            setTypingState(chatId, false).catch(console.error);
+            localforage.removeItem(`${chatId}_typing_timestamp`).catch(console.error);
+            setIsAgentTyping(false);
+          }
+        } catch (e) {
+          console.error('Ошибка парсинга SSE данных:', e);
         }
-      } finally {
-        // Убираем состояние печати
-        await setTypingState(chatId, false);
-        await localforage.removeItem(`${chatId}_typing_timestamp`);
+      };
+
+      eventSource.onerror = (error) => {
+        console.error('Ошибка SSE соединения:', error);
+        eventSource.close();
+        
+        // Убираем состояние печати в случае ошибки
+        setTypingState(chatId, false).catch(console.error);
+        localforage.removeItem(`${chatId}_typing_timestamp`).catch(console.error);
         setIsAgentTyping(false);
-      }
+
+        // Добавляем сообщение об ошибке
+        const errorMessage: Message = {
+          id: `${chatId.replace('chat_', '')}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          content: 'Извините, произошла ошибка при обработке вашего сообщения. Пожалуйста, попробуйте еще раз.',
+          sender: 'agent',
+          timestamp: new Date(),
+        };
+
+        addMessageToChat(chatId, errorMessage).catch(console.error);
+      };
 
     } catch (error) {
       console.error('Ошибка отправки сообщения:', error);

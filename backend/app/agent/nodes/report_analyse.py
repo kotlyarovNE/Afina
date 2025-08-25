@@ -57,7 +57,7 @@ def run_report_analysis(
 
     prompt_snapshot = f"[SYSTEM]\n{system}\n\n[USER]\n{user[:4000]}"
     # (сохраняем укороченную копию промпта в память, чтобы не раздувать state)
-
+    analyst_llm = analyst_llm.with_config(metadata={"display": True})
     resp = analyst_llm.invoke([("system", system), ("user", user)])
     md = str(resp.content).strip()
 
