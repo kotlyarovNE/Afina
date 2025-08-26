@@ -5,7 +5,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { Message, Chat, ChatFile } from '../types/chat';
-import { getChatData, getChatFiles } from '../utils/storage';
+import { getChatData, getChatFiles, removeFileFromChat as removeFileFromChatStorage } from '../utils/storage';
 
 interface ChatInterfaceProps {
   chat: Chat;
@@ -193,9 +193,11 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
     setShowFiles(!showFiles);
   };
 
-  const removeFileFromChat = async (fileName: string) => {
+  const handleRemoveFileFromChat = async (fileName: string) => {
     try {
-      console.log(`Удаление файла ${fileName} из чата ${chat.id}`);
+      await removeFileFromChatStorage(chat.id, fileName);
+      // Локально обновим список прикреплённых файлов без перезагрузки
+      setChatFiles(prev => prev.filter(f => f.name !== fileName));
       window.dispatchEvent(new CustomEvent('chatUpdated', { detail: { chatId: chat.id } }));
     } catch (error) {
       console.error('Ошибка удаления файла из чата:', error);
@@ -276,7 +278,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
                         </div>
                       </div>
                       <button
-                        onClick={() => removeFileFromChat(file.name)}
+                        onClick={() => handleRemoveFileFromChat(file.name)}
                         className="p-1 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded transition-all"
                       >
                         <X className="w-4 h-4" />

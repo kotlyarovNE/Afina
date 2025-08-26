@@ -11,6 +11,8 @@ PROXY_URL="http://127.0.0.1:${PROXY_PORT}"
 WEB_URL="http://127.0.0.1:${WEB_PORT}"
 CERT_PATH="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
 
+COMBINED_CA="$HOME/.mitmproxy/mitmproxy+certifi.pem"
+
 # Сгенерируем токен (твой «пароль») один раз на запуск
 MITM_TOKEN="$(python3 - <<'PY'
 import secrets; print(secrets.token_urlsafe(32))
@@ -53,16 +55,44 @@ export HTTPS_PROXY="$PROXY_URL"
 export ALL_PROXY="$PROXY_URL"
 export NO_PROXY="localhost,127.0.0.1"
 
+
+# сразу после проверки, что mitmweb поднялся
+for i in {1..50}; do
+  [ -f "$CERT_PATH" ] && break
+  sleep 0.1
+done
+if [ ! -f "$CERT_PATH" ]; then
+  echo "❌ Не найден CA mitmproxy: $CERT_PATH"
+  exit 1
+fi
+
+# 🔑 важно для ddgs:
+export DDGS_PROXY="$PROXY_URL"
+python3 - <<'PY'
+import certifi, os, sys
+mitm = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
+out  = os.path.expanduser("~/.mitmproxy/mitmproxy+certifi.pem")
+with open(out, "wb") as w:
+    w.write(open(mitm, "rb").read())
+    w.write(open(certifi.where(), "rb").read())
+print(out)
+PY
+
+export SSL_CERT_FILE="$COMBINED_CA"
+export REQUESTS_CA_BUNDLE="$COMBINED_CA"
+export CURL_CA_BUNDLE="$COMBINED_CA"
+
 # Python/Requests/httpx/OpenAI клиент (используют certifi) будет доверять этому CA:
-export REQUESTS_CA_BUNDLE="$CERT_PATH"
-export SSL_CERT_FILE="$CERT_PATH"
-export CURL_CA_BUNDLE="$CERT_PATH"
+# export REQUESTS_CA_BUNDLE="$CERT_PATH"
+# export SSL_CERT_FILE="$CERT_PATH"
+# export CURL_CA_BUNDLE="$CERT_PATH"
 
 # Node.js (Next.js) пусть тоже доверяет:
 export NODE_EXTRA_CA_CERTS="$CERT_PATH"
 
 echo "📍 Mitmweb UI: ${WEB_URL}/?token=${MITM_TOKEN}"
 echo "   (или используй заголовок Authorization: Bearer ${MITM_TOKEN})"
+
 
 # ---- (опционально) Глобальный системный прокси на macOS для ВСЕГО трафика ----
 # Включай, только если реально хочешь весь трафик системы:
