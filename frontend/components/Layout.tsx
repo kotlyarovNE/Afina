@@ -101,7 +101,7 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
   };
 
   return (
-    <div className="flex h-dvh min-h-0 bg-gray-50">
+    <div className="flex h-screen min-h-0 bg-gray-50">
       <Sidebar
         isOpen={isSidebarOpen}
         onToggle={() => setIsSidebarOpen(!isSidebarOpen)}
